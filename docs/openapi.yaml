@@ -1,0 +1,812 @@
+openapi: 3.0.3
+info:
+  title: Payment Processing API
+  description: |
+    REST API for initiating payments, querying status, ingesting gateway webhooks, health checks, and operational metrics.
+
+    **Correlation:** Clients may send `X-Request-Id` or `X-Correlation-Id`; the API echoes `X-Request-Id` on responses.
+
+    **Initiating payments:** `POST /payments` requires a non-empty `Idempotency-Key` header. Replays with the same key return the existing payment (`200`) instead of creating a duplicate (`201`).
+  version: 0.1.0
+
+servers:
+  - url: /
+    description: API root (same origin as the server)
+
+tags:
+  - name: Payments
+    description: Create and retrieve payment aggregates
+  - name: Webhooks
+    description: Gateway callbacks for asynchronous payment outcomes
+  - name: Operations
+    description: Health and metrics
+
+paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Liveness / readiness snapshot
+      description: Reports process uptime and database connectivity. Returns `503` when the database probe fails.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Database reachable — status `ok`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthSnapshot'
+              examples:
+                healthy:
+                  summary: DB up
+                  value:
+                    status: ok
+                    uptimeSeconds: 12450
+                    database: up
+                    timestamp: '2026-05-06T12:00:00.000Z'
+        '503':
+          description: Database unreachable — status `degraded`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthSnapshot'
+              examples:
+                degraded:
+                  value:
+                    status: degraded
+                    uptimeSeconds: 12450
+                    database: down
+                    timestamp: '2026-05-06T12:00:00.000Z'
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Payment aggregates for observability
+      description: Returns counts by payment status and retry statistics (not Prometheus format).
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsEnvelope'
+              examples:
+                sample:
+                  value:
+                    data:
+                      totalPayments: 42
+                      byStatus:
+                        Pending: 8
+                        Processing: 1
+                        Success: 30
+                        Failed: 3
+                      retrySummary:
+                        sumRetryCount: 15
+                        avgRetryCount: 0.35714285714285715
+                        maxRetryCount: 5
+                        pendingPaymentsWithRetries: 2
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /payments:
+    post:
+      tags: [Payments]
+      summary: Initiate payment (idempotent)
+      description: Creates a `Pending` payment or returns an existing row for the same idempotency key.
+      operationId: initiatePayment
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitiatePaymentRequest'
+            examples:
+              usd:
+                summary: USD charge
+                value:
+                  amount: 12.34
+                  currency: USD
+              eur:
+                summary: EUR charge
+                value:
+                  amount: 99.99
+                  currency: EUR
+      responses:
+        '201':
+          description: New payment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentEnvelope'
+              examples:
+                created:
+                  value:
+                    data:
+                      id: clxk_payment_example
+                      idempotencyKey: pay-req-001
+                      amount: '12.3400'
+                      currency: USD
+                      status: Pending
+                      gatewayReferenceId: null
+                      retryCount: 0
+                      maxRetries: 5
+                      failureReason: null
+                      lockedUntil: null
+                      createdAt: '2026-05-06T12:00:00.000Z'
+                      updatedAt: '2026-05-06T12:00:00.000Z'
+        '200':
+          description: Idempotent replay — same idempotency key already stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentEnvelope'
+              examples:
+                replayed:
+                  value:
+                    data:
+                      id: clxk_payment_example
+                      idempotencyKey: pay-req-001
+                      amount: '12.3400'
+                      currency: USD
+                      status: Pending
+                      gatewayReferenceId: null
+                      retryCount: 0
+                      maxRetries: 5
+                      failureReason: null
+                      lockedUntil: null
+                      createdAt: '2026-05-06T12:00:00.000Z'
+                      updatedAt: '2026-05-06T12:00:01.000Z'
+        '400':
+          description: Missing `Idempotency-Key` header
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                missingKey:
+                  value:
+                    error:
+                      code: MISSING_IDEMPOTENCY_KEY
+                      message: Idempotency-Key header is required
+        '422':
+          description: Request body failed validation (e.g. invalid amount or currency length)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                validation:
+                  value:
+                    error:
+                      code: VALIDATION_ERROR
+                      message: Invalid request body
+                      details:
+                        fieldErrors:
+                          amount:
+                            - amount must be greater than 0
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /payments/{id}/process:
+    post:
+      tags: [Payments]
+      summary: Process a payment through the gateway
+      description: |
+        Moves a payment through its lifecycle by invoking the external payment gateway.
+
+        **Lifecycle transitions:**
+        - `Pending → Processing → Success` — gateway authorization succeeded
+        - `Pending → Processing → Pending` — gateway declined but retries remain (`retryCount < maxRetries`)
+        - `Pending → Processing → Failed` — gateway declined and max retries exhausted (`retryCount >= maxRetries`)
+
+        **Skipped outcomes (no gateway call made, current state returned):**
+        - `skipped_already_success` — payment already reached terminal `Success`; safe to call multiple times
+        - `skipped_terminal_failed` — payment exhausted all retries and is terminal `Failed`
+        - `skipped_busy` — another process currently holds the processing lease; retry after a short delay
+
+        Concurrency is handled via pessimistic row-level locking — at most one process will invoke
+        the gateway at a time for a given payment. `Success` is a terminal state and is never overwritten.
+      operationId: processPayment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Payment primary key (cuid)
+          schema:
+            type: string
+            example: clxk_payment_example
+      responses:
+        '200':
+          description: Processing completed or safely skipped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessPaymentEnvelope'
+              examples:
+                success:
+                  summary: Gateway authorized
+                  value:
+                    data:
+                      outcome: success
+                      attemptNumber: 1
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Success
+                        gatewayReferenceId: gw_1746600000000_a1b2c3
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: null
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:01.000Z'
+                failure:
+                  summary: Gateway declined — retry available
+                  value:
+                    data:
+                      outcome: failure
+                      attemptNumber: 1
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Pending
+                        gatewayReferenceId: null
+                        retryCount: 1
+                        maxRetries: 5
+                        failureReason: card_declined
+                        lockedUntil: null
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:01.000Z'
+                timeout:
+                  summary: Gateway timed out — counted as failure, retry available
+                  value:
+                    data:
+                      outcome: timeout
+                      attemptNumber: 1
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Pending
+                        gatewayReferenceId: null
+                        retryCount: 1
+                        maxRetries: 5
+                        failureReason: gateway_timeout
+                        lockedUntil: null
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:01.000Z'
+                alreadySuccess:
+                  summary: Payment already successful — no gateway call
+                  value:
+                    data:
+                      outcome: skipped_already_success
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Success
+                        gatewayReferenceId: gw_1746600000000_a1b2c3
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: null
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:01.000Z'
+                terminalFailed:
+                  summary: Retries exhausted — terminal Failed, no gateway call
+                  value:
+                    data:
+                      outcome: skipped_terminal_failed
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Failed
+                        gatewayReferenceId: null
+                        retryCount: 5
+                        maxRetries: 5
+                        failureReason: card_declined
+                        lockedUntil: null
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:05.000Z'
+                busy:
+                  summary: Another processor holds the lease — call back later
+                  value:
+                    data:
+                      outcome: skipped_busy
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-002
+                        amount: '10.0000'
+                        currency: USD
+                        status: Processing
+                        gatewayReferenceId: null
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: '2026-05-07T00:01:00.000Z'
+                        createdAt: '2026-05-07T00:00:00.000Z'
+                        updatedAt: '2026-05-07T00:00:01.000Z'
+        '404':
+          description: Payment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                notFound:
+                  value:
+                    error:
+                      code: NOT_FOUND
+                      message: 'Payment not found: clxk_missing'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get payment by id
+      operationId: getPaymentById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Payment primary key (cuid)
+          schema:
+            type: string
+            example: clxk_payment_example
+      responses:
+        '200':
+          description: Payment found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentEnvelope'
+              examples:
+                pending:
+                  value:
+                    data:
+                      id: clxk_payment_example
+                      idempotencyKey: pay-req-002
+                      amount: '10.0000'
+                      currency: USD
+                      status: Pending
+                      gatewayReferenceId: null
+                      retryCount: 0
+                      maxRetries: 5
+                      failureReason: null
+                      lockedUntil: null
+                      createdAt: '2026-05-06T12:00:00.000Z'
+                      updatedAt: '2026-05-06T12:00:00.000Z'
+                success:
+                  summary: After gateway capture
+                  value:
+                    data:
+                      id: clxk_payment_example
+                      idempotencyKey: pay-req-002
+                      amount: '10.0000'
+                      currency: USD
+                      status: Success
+                      gatewayReferenceId: gw_ref_abc123
+                      retryCount: 0
+                      maxRetries: 5
+                      failureReason: null
+                      lockedUntil: null
+                      createdAt: '2026-05-06T12:00:00.000Z'
+                      updatedAt: '2026-05-06T12:05:00.000Z'
+        '404':
+          description: Unknown payment id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                notFound:
+                  value:
+                    error:
+                      code: NOT_FOUND
+                      message: 'Payment not found: pay_missing'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /webhooks/payment:
+    post:
+      tags: [Webhooks]
+      summary: Gateway payment webhook
+      description: |
+        Ingests PSP callbacks keyed by `gatewayReferenceId`. Responses use `200` when applied to a loaded payment,
+        or `202` when the event is queued because no payment row matches yet (early webhook).
+
+        Common `data.outcome` values include `applied_success`, `already_success`, `queued_early_no_payment`,
+        `applied_failed`, `already_failed`, `ignored_failed_vs_success_conflict`, and variants from reconciliation flows.
+      operationId: postPaymentWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhookBody'
+            examples:
+              success:
+                summary: Charge succeeded
+                value:
+                  gatewayReferenceId: gw_ref_abc123
+                  status: success
+              failed:
+                summary: Charge failed at PSP
+                value:
+                  gatewayReferenceId: gw_ref_abc123
+                  status: failed
+                  reason: issuer_declined
+      responses:
+        '200':
+          description: Webhook accepted and processed (or duplicate/idempotent outcome)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEnvelope'
+              examples:
+                appliedSuccess:
+                  value:
+                    data:
+                      outcome: applied_success
+                      webhookEventId: wh_evt_1
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-003
+                        amount: '25.0000'
+                        currency: USD
+                        status: Success
+                        gatewayReferenceId: gw_ref_abc123
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: null
+                        createdAt: '2026-05-06T12:00:00.000Z'
+                        updatedAt: '2026-05-06T12:02:00.000Z'
+                duplicateSuccess:
+                  summary: Duplicate callback
+                  value:
+                    data:
+                      outcome: already_success
+                      webhookEventId: wh_evt_2
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-003
+                        amount: '25.0000'
+                        currency: USD
+                        status: Success
+                        gatewayReferenceId: gw_ref_abc123
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: null
+                        createdAt: '2026-05-06T12:00:00.000Z'
+                        updatedAt: '2026-05-06T12:02:00.000Z'
+                conflictIgnored:
+                  summary: Failed webhook after terminal Success
+                  value:
+                    data:
+                      outcome: ignored_failed_vs_success_conflict
+                      webhookEventId: wh_evt_3
+                      payment:
+                        id: clxk_payment_example
+                        idempotencyKey: pay-req-003
+                        amount: '25.0000'
+                        currency: USD
+                        status: Success
+                        gatewayReferenceId: gw_ref_abc123
+                        retryCount: 0
+                        maxRetries: 5
+                        failureReason: null
+                        lockedUntil: null
+                        createdAt: '2026-05-06T12:00:00.000Z'
+                        updatedAt: '2026-05-06T12:02:00.000Z'
+        '202':
+          description: Stored for later correlation — no payment row with this gateway reference yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEnvelopeQueued'
+              examples:
+                early:
+                  value:
+                    data:
+                      outcome: queued_early_no_payment
+                      webhookEventId: wh_evt_early
+        '422':
+          description: Invalid webhook JSON (schema validation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                invalid:
+                  value:
+                    error:
+                      code: VALIDATION_ERROR
+                      message: Invalid request body
+                      details:
+                        fieldErrors:
+                          gatewayReferenceId:
+                            - gatewayReferenceId is required
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-supplied unique key for safe retries. Same key must yield the same logical payment (no double charge).
+      schema:
+        type: string
+        minLength: 1
+      example: pay-client-req-20260506-001
+
+  schemas:
+    ProcessPaymentOutcome:
+      type: string
+      description: |
+        Result of a process attempt:
+        - `success` — gateway authorized; payment status is now `Success`
+        - `failure` — gateway declined; `retryCount` incremented; status returns to `Pending` or becomes terminal `Failed`
+        - `timeout` — gateway did not respond in time; treated identically to `failure`
+        - `skipped_already_success` — payment was already `Success`; no gateway call made
+        - `skipped_terminal_failed` — payment exhausted all retries; status is terminal `Failed`
+        - `skipped_busy` — another processor holds the processing lease; try again shortly
+      enum:
+        - success
+        - failure
+        - timeout
+        - skipped_already_success
+        - skipped_terminal_failed
+        - skipped_busy
+
+    ProcessPaymentEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [payment, outcome]
+          properties:
+            payment:
+              $ref: '#/components/schemas/PaymentResource'
+            outcome:
+              $ref: '#/components/schemas/ProcessPaymentOutcome'
+            attemptNumber:
+              type: integer
+              nullable: true
+              description: Sequential attempt number within this payment. Absent for skipped outcomes.
+              example: 1
+
+    PaymentStatus:
+      type: string
+      description: Aggregate payment lifecycle state (Prisma `PaymentStatus`).
+      enum:
+        - Pending
+        - Processing
+        - Success
+        - Failed
+
+    PaymentResource:
+      type: object
+      required:
+        - id
+        - idempotencyKey
+        - amount
+        - currency
+        - status
+        - gatewayReferenceId
+        - retryCount
+        - maxRetries
+        - failureReason
+        - lockedUntil
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+        idempotencyKey:
+          type: string
+        amount:
+          type: string
+          description: Decimal serialized as string (no floating-point rounding in API).
+          example: '12.3400'
+        currency:
+          type: string
+          description: ISO 4217 alphabetic code, up to 3 characters.
+          maxLength: 3
+          example: USD
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        gatewayReferenceId:
+          type: string
+          nullable: true
+        retryCount:
+          type: integer
+        maxRetries:
+          type: integer
+        failureReason:
+          type: string
+          nullable: true
+        lockedUntil:
+          type: string
+          format: date-time
+          nullable: true
+          description: Processor lease expiry while status is `Processing`.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    PaymentEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/PaymentResource'
+
+    InitiatePaymentRequest:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          description: Charge amount (> 0, finite).
+          example: 12.34
+        currency:
+          type: string
+          minLength: 1
+          maxLength: 3
+          description: ISO 4217 currency code.
+          example: USD
+
+    PaymentWebhookBody:
+      type: object
+      required: [gatewayReferenceId, status]
+      properties:
+        gatewayReferenceId:
+          type: string
+          minLength: 1
+          description: PSP charge / intent reference (must match stored payment when correlating).
+          example: gw_ref_abc123
+        status:
+          type: string
+          enum: [success, failed]
+          description: Terminal-ish outcome from the gateway perspective.
+        reason:
+          type: string
+          description: Optional human- or gateway-readable decline reason (avoid logging PCI data).
+          example: issuer_declined
+
+    WebhookEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [outcome, webhookEventId]
+          properties:
+            outcome:
+              type: string
+              description: Processing result for this delivery (see operation description).
+              example: applied_success
+            webhookEventId:
+              type: string
+            payment:
+              $ref: '#/components/schemas/PaymentResource'
+
+    WebhookEnvelopeQueued:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [outcome, webhookEventId]
+          properties:
+            outcome:
+              type: string
+              example: queued_early_no_payment
+            webhookEventId:
+              type: string
+
+    HealthSnapshot:
+      type: object
+      required: [status, uptimeSeconds, database, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        uptimeSeconds:
+          type: integer
+        database:
+          type: string
+          enum: [up, down]
+        timestamp:
+          type: string
+          format: date-time
+
+    MetricsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [totalPayments, byStatus, retrySummary]
+          properties:
+            totalPayments:
+              type: integer
+            byStatus:
+              type: object
+              additionalProperties:
+                type: integer
+              description: Counts keyed by `PaymentStatus` string.
+            retrySummary:
+              type: object
+              required:
+                - sumRetryCount
+                - avgRetryCount
+                - maxRetryCount
+                - pendingPaymentsWithRetries
+              properties:
+                sumRetryCount:
+                  type: integer
+                avgRetryCount:
+                  type: number
+                maxRetryCount:
+                  type: integer
+                pendingPaymentsWithRetries:
+                  type: integer
+                  description: Pending payments with `retryCount > 0`.
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+        details:
+          description: Present for validation errors (Zod flatten shape) and some app errors.
+          nullable: true
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+
+  responses:
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            generic:
+              value:
+                error:
+                  code: INTERNAL_ERROR
+                  message: An unexpected error occurred

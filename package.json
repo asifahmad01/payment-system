@@ -1,0 +1,47 @@
+{
+  "name": "payment-processing-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Payment processing API — base scaffold",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "test": "jest --runInBand",
+    "test:watch": "jest --watch",
+    "prisma:generate": "DATABASE_URL=${DATABASE_URL:-postgresql://payment:payment@localhost:5432/payment?schema=public} prisma generate",
+    "prisma:migrate": "DATABASE_URL=${DATABASE_URL:-postgresql://payment:payment@localhost:5432/payment?schema=public} prisma migrate dev",
+    "prisma:studio": "DATABASE_URL=${DATABASE_URL:-postgresql://payment:payment@localhost:5432/payment?schema=public} prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.7.0",
+    "bullmq": "^5.76.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "prisma": "^6.7.0",
+    "swagger-ui-express": "^5.0.1",
+    "yaml": "^2.8.4",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.15.3",
+    "@types/supertest": "^6.0.3",
+    "@types/swagger-ui-express": "^4.1.8",
+    "jest": "^29.7.0",
+    "pino-pretty": "^13.0.0",
+    "supertest": "^7.1.0",
+    "ts-jest": "^29.3.4",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

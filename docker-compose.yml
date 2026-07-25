@@ -1,0 +1,70 @@
+# Full stack for local/demo deployment: API + PostgreSQL + Redis (retries & advisory locking helpers).
+# Usage: docker compose up --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+      POSTGRES_DB: payment
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U payment -d payment']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    command: ['redis-server', '--appendonly', 'yes']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://payment:payment@postgres:5432/payment?schema=public
+      REDIS_URL: redis://redis:6379
+      PAYMENT_RETRY_ENABLED: 'true'
+      PAYMENT_RETRY_BASE_DELAY_MS: '5000'
+      PAYMENT_RETRY_MAX_DELAY_MS: '900000'
+      PAYMENT_RETRY_EXPONENT_CAP: '10'
+      PAYMENT_RECOVERY_ENABLED: 'true'
+      PAYMENT_RECOVERY_INTERVAL_MS: '60000'
+      PAYMENT_RECOVERY_MIN_IDLE_AFTER_LEASE_MS: '0'
+      PAYMENT_RECOVERY_BATCH_SIZE: '50'
+      PAYMENT_GATEWAY_SIM_SUCCESS_PROB: '0.85'
+      PAYMENT_GATEWAY_SIM_FAILURE_PROB: '0.10'
+      PAYMENT_GATEWAY_SIM_TIMEOUT_PROB: '0.05'
+      PAYMENT_GATEWAY_SIM_DELAY_MIN_MS: '500'
+      PAYMENT_GATEWAY_SIM_DELAY_MAX_MS: '3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

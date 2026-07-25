@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Lifecycle of the aggregate payment (charge) record.
+enum PaymentStatus {
+  Pending
+  Processing
+  Success
+  Failed
+}
+
+/// Lifecycle of a single outbound gateway interaction for a payment.
+enum PaymentAttemptStatus {
+  Pending
+  Processing
+  Success
+  Failed
+}
+
+model Payment {
+  id                 String        @id @default(cuid())
+  /// Unique client-supplied key so retries cannot double-charge (HTTP Idempotency-Key semantics).
+  idempotencyKey     String        @unique(map: "payment_idempotency_key_uidx")
+  amount             Decimal       @db.Decimal(18, 4)
+  /// ISO 4217 alphabetic code (e.g. USD).
+  currency           String        @db.Char(3)
+  status             PaymentStatus @default(Pending)
+  /// Gateway-side identifier once authorized/captured; unique when present for reconciliation & webhook correlation.
+  gatewayReferenceId String?       @unique(map: "payment_gateway_reference_uidx")
+  retryCount         Int           @default(0)
+  maxRetries         Int           @default(5)
+  failureReason      String?
+  /// Lease / pessimistic lock expiry for processors claiming this row without flipping terminal states.
+  lockedUntil        DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  attempts PaymentAttempt[]
+
+  @@index([status], map: "payment_status_idx")
+  @@index([status, lockedUntil], map: "payment_status_locked_until_idx")
+  @@index([createdAt], map: "payment_created_at_idx")
+}
+
+model PaymentAttempt {
+  id              String               @id @default(cuid())
+  paymentId       String
+  payment         Payment              @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  attemptNumber   Int
+  status          PaymentAttemptStatus
+  gatewayResponse Json?
+  errorMessage    String?
+  startedAt       DateTime             @default(now())
+  completedAt     DateTime?
+
+  @@unique([paymentId, attemptNumber], map: "payment_attempt_payment_attempt_no_uidx")
+  @@index([paymentId], map: "payment_attempt_payment_id_idx")
+  @@index([status], map: "payment_attempt_status_idx")
+  @@index([startedAt], map: "payment_attempt_started_at_idx")
+}
+
+model WebhookEvent {
+  id                 String   @id @default(cuid())
+  gatewayReferenceId String
+  eventType          String   @db.VarChar(128)
+  payload            Json
+  processed          Boolean  @default(false)
+  createdAt          DateTime @default(now())
+
+  @@index([gatewayReferenceId], map: "webhook_event_gateway_reference_idx")
+  @@index([processed, createdAt], map: "webhook_event_processed_created_idx")
+  @@index([gatewayReferenceId, processed], map: "webhook_event_gateway_processed_idx")
+}
